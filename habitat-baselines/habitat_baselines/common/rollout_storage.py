@@ -9,6 +9,7 @@ from typing import Any, Dict, Iterator, Optional
 
 import numpy as np
 import torch
+import random
 
 from habitat_baselines.common.baseline_registry import baseline_registry
 from habitat_baselines.common.storage import Storage
@@ -204,6 +205,20 @@ class RolloutStorage(Storage):
                     + self.buffers["rewards"][step]
                 )
 
+    def sample_triplet(self):
+        index = random.randint(0, self.num_steps - 1)
+        obs = dict()
+        for k, v in self.buffers["observations"].items():
+            obs[k] = v[index]
+
+        next_obs = dict()
+        for k, v in self.buffers["observations"].items():
+            next_obs[k] = v[index + 1]
+
+        action = self.buffers["actions"][index]
+
+        return obs, action, next_obs
+
     def data_generator(
         self,
         advantages: Optional[torch.Tensor],
@@ -268,6 +283,12 @@ class RolloutStorage(Storage):
     def get_current_step(self, env_slice, buffer_index):
         return self.buffers[
             self.current_rollout_step_idxs[buffer_index],
+            env_slice,
+        ]
+
+    def get_next_step(self, env_slice, buffer_index):
+        return self.buffers[
+            self.current_rollout_step_idxs[buffer_index] + 1,
             env_slice,
         ]
 

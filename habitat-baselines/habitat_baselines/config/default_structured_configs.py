@@ -361,6 +361,20 @@ class DDPPOConfig(HabitatBaselinesBaseConfig):
 
 
 @dataclass
+class ICMConfig(HabitatBaselinesBaseConfig):
+    forward_loss_coef: float = 0.2
+
+
+@dataclass
+class ExploreConfig(HabitatBaselinesBaseConfig):
+    int_rew_coef: float = 0.1
+    model_learning_rate: float = 2.5e-4
+    model_n_epochs: int = 3
+
+    icm: ICMConfig = ICMConfig()
+
+
+@dataclass
 class AgentAccessMgrConfig(HabitatBaselinesBaseConfig):
     type: str = "SingleAgentAccessMgr"
     ###############################
@@ -396,6 +410,7 @@ class RLConfig(HabitatBaselinesBaseConfig):
     )
     ppo: PPOConfig = PPOConfig()
     ddppo: DDPPOConfig = DDPPOConfig()
+    explore: ExploreConfig = ExploreConfig()
     ver: VERConfig = VERConfig()
     auxiliary_losses: Dict[str, AuxLossConfig] = field(default_factory=dict)
 

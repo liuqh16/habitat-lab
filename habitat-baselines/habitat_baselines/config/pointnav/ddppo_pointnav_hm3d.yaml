@@ -87,3 +87,11 @@ habitat_baselines:
       backbone: resnet50
       rnn_type: LSTM
       num_recurrent_layers: 2
+
+    explore:
+      int_rew_coef: 0.1
+      model_learning_rate: 2.5e-4
+      model_n_epochs: 3
+
+      icm:
+        forward_loss_coef: 0.2

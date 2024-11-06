@@ -391,6 +391,62 @@ class ResNetCLIPEncoder(nn.Module):
         return x
 
 
+def init(module, weight_init, bias_init, gain=1):
+    weight_init(module.weight.data, gain=gain)
+    bias_init(module.bias.data)
+    return module
+
+
+class InverseDynamicsNet(nn.Module):
+    def __init__(self, num_actions, emb_size=512, p_dropout=0.0):
+        super(InverseDynamicsNet, self).__init__()
+        self.num_actions = num_actions 
+        
+        init_ = lambda m: init(m, nn.init.orthogonal_, lambda x: nn.init.
+                            constant_(x, 0), nn.init.calculate_gain('relu'))
+        self.inverse_dynamics = nn.Sequential(
+            init_(nn.Linear(2 * emb_size, 256)), 
+            nn.ReLU(),
+            nn.Dropout(p=p_dropout)
+        )
+
+        init_ = lambda m: init(m, nn.init.orthogonal_, 
+            lambda x: nn.init.constant_(x, 0))
+        self.id_out = init_(nn.Linear(256, self.num_actions))
+
+        
+    def forward(self, state_embedding, next_state_embedding):
+        inputs = torch.cat((state_embedding, next_state_embedding), dim=1)
+        action_logits = self.id_out(self.inverse_dynamics(inputs))
+        return action_logits
+
+
+class ForwardDynamicsNet(nn.Module):
+    def __init__(self, num_actions, hidden_dim=1024):
+        super(ForwardDynamicsNet, self).__init__()
+        self.num_actions = num_actions 
+
+        init_ = lambda m: init(m, nn.init.orthogonal_, lambda x: nn.init.
+                            constant_(x, 0), nn.init.calculate_gain('relu'))
+    
+        self.forward_dynamics = nn.Sequential(
+            init_(nn.Linear(hidden_dim + self.num_actions, hidden_dim)), 
+            nn.ReLU(), 
+        )
+
+        init_ = lambda m: init(m, nn.init.orthogonal_, 
+            lambda x: nn.init.constant_(x, 0))
+
+        self.fd_out = init_(nn.Linear(hidden_dim, hidden_dim))
+
+    def forward(self, state_embedding, action):
+        action = action.squeeze()
+        action_one_hot = F.one_hot(action, num_classes=self.num_actions).float()
+        inputs = torch.cat((state_embedding, action_one_hot), dim=1)
+        next_state_emb = self.fd_out(self.forward_dynamics(inputs))
+        return next_state_emb
+
+
 class PointNavResNetNet(Net):
     """Network which passes the input image through CNN and concatenates
     goal vector with CNN's output and passes that through RNN.
@@ -417,17 +473,20 @@ class PointNavResNetNet(Net):
         self.prev_action_embedding: nn.Module
         self.discrete_actions = discrete_actions
         self._n_prev_action = 32
-        if discrete_actions:
-            self.prev_action_embedding = nn.Embedding(
-                action_space.n + 1, self._n_prev_action
-            )
-        else:
-            num_actions = get_num_actions(action_space)
-            self.prev_action_embedding = nn.Linear(
-                num_actions, self._n_prev_action
-            )
+        if rnn_type != "none":
+            if discrete_actions:
+                self.prev_action_embedding = nn.Embedding(
+                    action_space.n + 1, self._n_prev_action
+                )
+            else:
+                num_actions = get_num_actions(action_space)
+                self.prev_action_embedding = nn.Linear(
+                    num_actions, self._n_prev_action
+                )
+        self._rnn_type = rnn_type
         self._n_prev_action = 32
         rnn_input_size = self._n_prev_action  # test
+        fc_input_size = hidden_size
 
         # Only fuse the 1D state inputs. Other inputs are processed by the
         # visual encoder
@@ -467,6 +526,7 @@ class PointNavResNetNet(Net):
             )
             self.tgt_embeding = nn.Linear(n_input_goal, 32)
             rnn_input_size += 32
+            fc_input_size += 32
 
         if ObjectGoalSensor.cls_uuid in observation_space.spaces:
             self._n_object_categories = (
@@ -479,6 +539,7 @@ class PointNavResNetNet(Net):
                 self._n_object_categories, 32
             )
             rnn_input_size += 32
+            fc_input_size += 32
 
         if EpisodicGPSSensor.cls_uuid in observation_space.spaces:
             input_gps_dim = observation_space.spaces[
@@ -486,6 +547,7 @@ class PointNavResNetNet(Net):
             ].shape[0]
             self.gps_embedding = nn.Linear(input_gps_dim, 32)
             rnn_input_size += 32
+            fc_input_size += 32
 
         if PointGoalSensor.cls_uuid in observation_space.spaces:
             input_pointgoal_dim = observation_space.spaces[
@@ -493,6 +555,7 @@ class PointNavResNetNet(Net):
             ].shape[0]
             self.pointgoal_embedding = nn.Linear(input_pointgoal_dim, 32)
             rnn_input_size += 32
+            fc_input_size += 32
 
         if HeadingSensor.cls_uuid in observation_space.spaces:
             input_heading_dim = (
@@ -501,6 +564,7 @@ class PointNavResNetNet(Net):
             assert input_heading_dim == 2, "Expected heading with 2D rotation."
             self.heading_embedding = nn.Linear(input_heading_dim, 32)
             rnn_input_size += 32
+            fc_input_size += 32
 
         if ProximitySensor.cls_uuid in observation_space.spaces:
             input_proximity_dim = observation_space.spaces[
@@ -508,6 +572,7 @@ class PointNavResNetNet(Net):
             ].shape[0]
             self.proximity_embedding = nn.Linear(input_proximity_dim, 32)
             rnn_input_size += 32
+            fc_input_size += 32
 
         if EpisodicCompassSensor.cls_uuid in observation_space.spaces:
             assert (
@@ -519,6 +584,7 @@ class PointNavResNetNet(Net):
             input_compass_dim = 2  # cos and sin of the angle
             self.compass_embedding = nn.Linear(input_compass_dim, 32)
             rnn_input_size += 32
+            fc_input_size += 32
 
         for uuid in [
             ImageGoalSensor.cls_uuid,
@@ -593,12 +659,22 @@ class PointNavResNetNet(Net):
                     nn.ReLU(True),
                 )
 
-        self.state_encoder = build_rnn_state_encoder(
-            (0 if self.is_blind else self._hidden_size) + rnn_input_size,
-            self._hidden_size,
-            rnn_type=rnn_type,
-            num_layers=num_recurrent_layers,
-        )
+        if self._rnn_type != "none":
+            self.state_encoder = build_rnn_state_encoder(
+                (0 if self.is_blind else self._hidden_size) + rnn_input_size,
+                self._hidden_size,
+                rnn_type=rnn_type,
+                num_layers=num_recurrent_layers,
+            )
+        else:
+            # use FC encoder
+            self.state_encoder = nn.Sequential(
+                nn.Linear(fc_input_size, self._hidden_size),
+                nn.ReLU(inplace=True),
+                nn.Linear(self._hidden_size, self._hidden_size), 
+                nn.ReLU(inplace=True),
+                nn.Linear(self._hidden_size, self._hidden_size)
+            )
 
         self.train()
 
@@ -744,24 +820,29 @@ class PointNavResNetNet(Net):
                 goal_visual_fc = getattr(self, f"{uuid}_fc")
                 x.append(goal_visual_fc(goal_visual_output))
 
-        if self.discrete_actions:
-            prev_actions = prev_actions.squeeze(-1)
-            start_token = torch.zeros_like(prev_actions)
-            # The mask means the previous action will be zero, an extra dummy action
-            prev_actions = self.prev_action_embedding(
-                torch.where(masks.view(-1), prev_actions + 1, start_token)
+        if self._rnn_type != "none":
+            if self.discrete_actions:
+                prev_actions = prev_actions.squeeze(-1)
+                start_token = torch.zeros_like(prev_actions)
+                # The mask means the previous action will be zero, an extra dummy action
+                prev_actions = self.prev_action_embedding(
+                    torch.where(masks.view(-1), prev_actions + 1, start_token)
+                )
+            else:
+                prev_actions = self.prev_action_embedding(
+                    masks * prev_actions.float()
+                )
+
+            x.append(prev_actions)
+
+            out = torch.cat(x, dim=1)
+            out, rnn_hidden_states = self.state_encoder(
+                out, rnn_hidden_states, masks, rnn_build_seq_info
             )
+            aux_loss_state["rnn_output"] = out
+
+            return out, rnn_hidden_states, aux_loss_state
         else:
-            prev_actions = self.prev_action_embedding(
-                masks * prev_actions.float()
-            )
-
-        x.append(prev_actions)
-
-        out = torch.cat(x, dim=1)
-        out, rnn_hidden_states = self.state_encoder(
-            out, rnn_hidden_states, masks, rnn_build_seq_info
-        )
-        aux_loss_state["rnn_output"] = out
-
-        return out, rnn_hidden_states, aux_loss_state
+            out = torch.cat(x, dim=1)
+            out = self.state_encoder(out)
+            return out, rnn_hidden_states, aux_loss_state

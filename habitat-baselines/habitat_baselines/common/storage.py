@@ -45,8 +45,14 @@ class Storage(abc.ABC):
     def after_update(self) -> None:
         pass
 
+    def sample_triplet(self):
+        pass
+
     def get_last_step(self):
         pass
 
     def get_current_step(self, env_slice, buffer_index):
+        pass
+
+    def get_next_step(self, env_slice, buffer_index):
         pass

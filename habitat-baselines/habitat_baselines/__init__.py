@@ -13,6 +13,7 @@ from habitat_baselines.il.trainers.eqa_cnn_pretrain_trainer import (
 from habitat_baselines.il.trainers.pacman_trainer import PACMANTrainer
 from habitat_baselines.il.trainers.vqa_trainer import VQATrainer
 from habitat_baselines.rl.ppo.ppo_trainer import PPOTrainer
+from habitat_baselines.rl.ppo.icm_trainer import ICMTrainer
 from habitat_baselines.rl.ver.ver_trainer import VERTrainer
 from habitat_baselines.version import VERSION as __version__  # noqa: F401
 
@@ -21,6 +22,7 @@ __all__ = [
     "BaseRLTrainer",
     "BaseILTrainer",
     "PPOTrainer",
+    "ICMTrainer",
     "RolloutStorage",
     "EQACNNPretrainTrainer",
     "PACMANTrainer",
