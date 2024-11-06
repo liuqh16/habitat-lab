@@ -19,6 +19,8 @@ from habitat.config.default import get_config
 from habitat.core.agent import Agent
 from habitat.core.env import Env
 
+from habitat.utils.visualizations import maps
+
 
 class Benchmark:
     r"""Benchmark for evaluating agents in environments."""
@@ -150,6 +152,11 @@ class Benchmark:
                         agg_metrics[m + "/" + str(sub_m)] += sub_v
                 else:
                     agg_metrics[m] += v
+
+            top_down_map = maps.get_topdown_map_from_sim(
+                self._env.sim, map_resolution=1024
+            )
+
             count_episodes += 1
             pbar.update(1)
 

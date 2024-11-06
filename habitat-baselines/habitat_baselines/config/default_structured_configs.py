@@ -496,6 +496,9 @@ class HabitatBaselinesConfig(HabitatBaselinesBaseConfig):
     # If not specified, there is no callback.
     on_save_ckpt_callback: Optional[HydraCallbackConfig] = None
 
+    # Costom config
+    reward_free: bool = False
+
 
 @dataclass
 class HabitatBaselinesRLConfig(HabitatBaselinesConfig):

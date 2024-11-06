@@ -244,8 +244,12 @@ class HabitatEvaluator(Evaluator):
                 # episode ended
                 if not not_done_masks[i].any().item():
                     pbar.update()
+                    n_valid_locations = (infos[i]['top_down_map']['map']==1).sum()
+                    n_seen_locations = (infos[i]['top_down_map']['fog_of_war_mask']==1).sum()
+                    coverage = n_seen_locations / n_valid_locations
                     episode_stats = {
-                        "reward": current_episode_reward[i].item()
+                        "reward": current_episode_reward[i].item(),
+                        "coverage": coverage
                     }
                     episode_stats.update(extract_scalars_from_info(infos[i]))
                     current_episode_reward[i] = 0

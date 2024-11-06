@@ -427,6 +427,9 @@ class PPOTrainer(BaseRLTrainer):
             )
             rewards = rewards.unsqueeze(1)
 
+            if self.config.habitat_baselines.reward_free:
+                rewards.zero_()
+
             not_done_masks = torch.tensor(
                 [[not done] for done in dones],
                 dtype=torch.bool,
