@@ -72,11 +72,11 @@ from habitat_baselines.utils.info_dict import (
 from habitat_baselines.utils.timing import g_timer
 
 
-@baseline_registry.register_trainer(name="ddppo-icm")
+@baseline_registry.register_trainer(name="ddppo-e3b")
 @baseline_registry.register_trainer(name="ppo")
-class ICMTrainer(BaseRLTrainer):
-    r"""Trainer class for PPO algorithm with ICM.
-    Paper: https://arxiv.org/abs/1705.05363.
+class E3BTrainer(BaseRLTrainer):
+    r"""Trainer class for PPO algorithm with E3B.
+    Paper: http://arxiv.org/abs/2210.05805.
     """
     supported_tasks = ["Nav-v0"]
 
@@ -142,15 +142,9 @@ class ICMTrainer(BaseRLTrainer):
                                                    emb_size=self.config.habitat_baselines.rl.ppo.hidden_size)
         self.inverse_dynamics.to(self.device)
 
-        self.forward_dynamics = ForwardDynamicsNet(num_actions=self._env_spec.action_space.n,
-                                                   hidden_dim=self.config.habitat_baselines.rl.ppo.hidden_size)
-        self.forward_dynamics.to(self.device)
-
         self.encoder_optimizer = torch.optim.Adam(self.encoder.parameters(),
                                                   lr=self.config.habitat_baselines.rl.explore.model_learning_rate)
         self.inverse_dynamics_optimizer = torch.optim.Adam(self.inverse_dynamics.parameters(),
-                                                           lr=self.config.habitat_baselines.rl.explore.model_learning_rate)
-        self.forward_dynamics_optimizer = torch.optim.Adam(self.forward_dynamics.parameters(),
                                                            lr=self.config.habitat_baselines.rl.explore.model_learning_rate)
 
         return baseline_registry.get_agent_access_mgr(
@@ -323,9 +317,15 @@ class ICMTrainer(BaseRLTrainer):
             lambda: deque(maxlen=self._ppo_cfg.reward_window_size)
         )
 
-        # ICM objects
+        # E3B objects
         self.current_episode_bonus_reward = torch.zeros_like(self.current_episode_reward)
-        self.bonus_buffer = torch.zeros_like(self.current_episode_reward)
+        self.elliptical_bonus_buffer = torch.zeros_like(self.current_episode_reward)
+
+        ridge = self.config.habitat_baselines.rl.explore.e3b.ridge
+        hidden_size = self.config.habitat_baselines.rl.ppo.hidden_size
+        self.inverse_covs = torch.stack([torch.eye(hidden_size) * (1. / ridge) \
+                                         for i in range(self.envs.num_envs)]).to(self.device)
+        self.outer_product_buffers = torch.empty(self.envs.num_envs, hidden_size, hidden_size).to(self.device)
 
         self.t_start = time.time()
 
@@ -391,10 +391,6 @@ class ICMTrainer(BaseRLTrainer):
                 env_slice, buffer_index
             )
 
-            next_step_batch = self._agent.rollouts.get_next_step(
-                env_slice, buffer_index
-            )
-
             profiling_wrapper.range_push("compute actions")
 
             # Obtain lenghts
@@ -413,10 +409,12 @@ class ICMTrainer(BaseRLTrainer):
 
             # Compute intrinsic reward bonus
             phi = self.encoder(step_batch["observations"], None, None, None, None)[0]
-            pred_next_phi = self.forward_dynamics(phi, step_batch["actions"])
-            next_phi = self.encoder(next_step_batch["observations"], None, None, None, None)[0]
-            bonus = F.mse_loss(pred_next_phi, next_phi, reduction="none").mean(1)
-            self.bonus_buffer.copy_(bonus.unsqueeze(1))
+            u = torch.bmm(phi.unsqueeze(1), self.inverse_covs)
+            elliptical_bonus = torch.bmm(u, phi.unsqueeze(2))
+            torch.bmm(u.permute(0, 2, 1), u, out=self.outer_product_buffers)
+            torch.mul(self.outer_product_buffers, -1./(1. + elliptical_bonus), out=self.outer_product_buffers)
+            torch.add(self.inverse_covs, self.outer_product_buffers, out=self.inverse_covs)
+            self.elliptical_bonus_buffer.copy_(elliptical_bonus[:, 0])
 
         profiling_wrapper.range_pop()  # compute actions
 
@@ -479,7 +477,7 @@ class ICMTrainer(BaseRLTrainer):
             if self.config.habitat_baselines.reward_free:
                 rewards.zero_()
 
-            bonus_rewards = self.bonus_buffer.squeeze().clone().detach().unsqueeze(1)
+            bonus_rewards = self.elliptical_bonus_buffer.squeeze().clone().detach().unsqueeze(1)
 
             not_done_masks = torch.tensor(
                 [[not done] for done in dones],
@@ -523,6 +521,11 @@ class ICMTrainer(BaseRLTrainer):
             self.current_episode_bonus_reward[env_slice].masked_fill_(
                 done_masks, 0.0
             )
+
+            # reset covariance matrices for finished episodes
+            for i, done in enumerate(dones):
+                if done:
+                    self.inverse_covs[i].copy_(torch.eye(self.inverse_covs.size(1)) * (1. / self.config.habitat_baselines.rl.explore.e3b.ridge))
 
             # Add intrinsic and extrinsic rewards together
             rewards = rewards + self.config.habitat_baselines.rl.explore.int_rew_coef * bonus_rewards
@@ -579,43 +582,28 @@ class ICMTrainer(BaseRLTrainer):
 
         losses = self._agent.updater.update(self._agent.rollouts)
 
-        # ICM stuff
-        inv_dynamics_loss, fwd_dynamics_loss = 0, 0
+        # E3B stuff
+        inv_dynamics_loss = 0
         for i in range(self.config.habitat_baselines.rl.explore.model_n_epochs):
 
-            # Compute IDM loss
             self.encoder_optimizer.zero_grad()
             self.inverse_dynamics_optimizer.zero_grad()
-            self.forward_dynamics_optimizer.zero_grad()
             obs, action, next_obs = self._agent.rollouts.sample_triplet()
             phi = self.encoder(obs, None, None, None, None)[0]
             next_phi = self.encoder(next_obs, None, None, None, None)[0]
             action_pred = F.log_softmax(self.inverse_dynamics(phi, next_phi), dim=-1)
-            idm_loss = F.nll_loss(action_pred, action.squeeze())
-
-            # Compute FDM loss
-            pred_next_phi = self.forward_dynamics(phi, action)
-            fdm_loss = F.mse_loss(pred_next_phi, next_phi)
-
-            loss = idm_loss * (1 - self.config.habitat_baselines.rl.explore.icm.forward_loss_coef) + \
-                   fdm_loss * self.config.habitat_baselines.rl.explore.icm.forward_loss_coef
-
+            loss = F.nll_loss(action_pred, action.squeeze())
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.encoder.parameters(), self.config.habitat_baselines.rl.ppo.max_grad_norm)
             torch.nn.utils.clip_grad_norm_(self.inverse_dynamics.parameters(), self.config.habitat_baselines.rl.ppo.max_grad_norm)
-            torch.nn.utils.clip_grad_norm_(self.forward_dynamics.parameters(), self.config.habitat_baselines.rl.ppo.max_grad_norm)
             self.encoder_optimizer.step()
             self.inverse_dynamics_optimizer.step()
-            self.forward_dynamics_optimizer.step()
-            inv_dynamics_loss += idm_loss.item()
-            fwd_dynamics_loss += fdm_loss.item()
+            inv_dynamics_loss += loss.item()
 
         if self.config.habitat_baselines.rl.explore.model_n_epochs > 0:
             inv_dynamics_loss /= self.config.habitat_baselines.rl.explore.model_n_epochs
-            fwd_dynamics_loss /= self.config.habitat_baselines.rl.explore.model_n_epochs
 
         losses["inv_dynamics_loss"] = inv_dynamics_loss
-        losses["fwd_dynamics_loss"] = fwd_dynamics_loss
 
         self._agent.rollouts.after_update()
         self._agent.after_update()

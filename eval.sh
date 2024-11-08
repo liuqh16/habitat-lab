@@ -1,4 +1,4 @@
-TRAINER_NAME=ddppo
+TRAINER_NAME=ddppo-e3b  # ddppo|ddppo-icm|ddppo-e3b
 
 MAGNUM_LOG=quiet HABITAT_SIM_LOG=quiet CUDA_VISIBLE_DEVICES=0 python -u -m habitat_baselines.run \
     --config-name=pointnav/ddppo_pointnav_hm3d_eval.yaml \

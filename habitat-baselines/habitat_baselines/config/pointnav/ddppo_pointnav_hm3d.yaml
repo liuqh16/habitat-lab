@@ -92,3 +92,6 @@ habitat_baselines:
 
       icm:
         forward_loss_coef: 0.2
+
+      e3b:
+        ridge: 0.1

@@ -366,12 +366,18 @@ class ICMConfig(HabitatBaselinesBaseConfig):
 
 
 @dataclass
+class E3BConfig(HabitatBaselinesBaseConfig):
+    ridge: float = 0.1
+
+
+@dataclass
 class ExploreConfig(HabitatBaselinesBaseConfig):
     int_rew_coef: float = 0.1
     model_learning_rate: float = 2.5e-4
     model_n_epochs: int = 3
 
     icm: ICMConfig = ICMConfig()
+    e3b: E3BConfig = E3BConfig()
 
 
 @dataclass
