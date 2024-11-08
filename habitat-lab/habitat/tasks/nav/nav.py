@@ -605,7 +605,7 @@ class SPL(Measure):
         self._metric = ep_success * (
             self._start_end_episode_distance
             / max(
-                self._start_end_episode_distance, self._agent_episode_distance
+                self._start_end_episode_distance, self._agent_episode_distance, 1e-8
             )
         )
 
@@ -681,6 +681,8 @@ class Collisions(Measure):
 class TopDownMap(Measure):
     r"""Top Down Map measure"""
 
+    cls_uuid: str = "top_down_map"
+
     def __init__(
         self,
         sim: "HabitatSim",
@@ -709,7 +711,7 @@ class TopDownMap(Measure):
         super().__init__()
 
     def _get_uuid(self, *args: Any, **kwargs: Any) -> str:
-        return "top_down_map"
+        return self.cls_uuid
 
     def get_original_map(self):
         top_down_map = maps.get_topdown_map_from_sim(
@@ -856,7 +858,7 @@ class TopDownMap(Measure):
         if hasattr(episode, "goals"):
             # draw source and target parts last to avoid overlap
             self._draw_goals_view_points(episode)
-            # self._draw_goals_aabb(episode)
+            self._draw_goals_aabb(episode)
             self._draw_goals_positions(episode)
             self._draw_shortest_path(episode, agent_position)
 
@@ -935,6 +937,39 @@ class TopDownMap(Measure):
                     self._map_resolution, sim=self._sim
                 ),
             )
+
+
+@registry.register_measure
+class TopDownMapCoverage(Measure):
+    r"""Coverage measure based on Top Down Map"""
+
+    def __init__(
+        self, sim: Simulator, config: "DictConfig", *args: Any, **kwargs: Any
+    ):
+        self._sim = sim
+        self._config = config
+
+        super().__init__()
+
+    def _get_uuid(self, *args: Any, **kwargs: Any) -> str:
+        return "top_down_map_coverage"
+    
+    def reset_metric(self, episode, task, *args: Any, **kwargs: Any):
+        task.measurements.check_measure_dependencies(
+            self.uuid, [TopDownMap.cls_uuid]
+        )
+        self.update_metric(episode=episode, task=task, *args, **kwargs)  # type: ignore
+
+    def update_metric(
+        self, episode, task: EmbodiedTask, *args: Any, **kwargs: Any
+    ):
+        top_down_map = task.measurements.measures[
+            TopDownMap.cls_uuid
+        ].get_metric()
+        n_valid_locations = (top_down_map["map"] == 1).sum()
+        n_unseen_locations = (top_down_map["fog_of_war_mask"] == 1).sum()
+        coverage = n_unseen_locations / n_valid_locations if n_valid_locations > 0 else 0
+        self._metric = coverage
 
 
 @registry.register_measure

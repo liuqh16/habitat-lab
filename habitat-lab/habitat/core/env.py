@@ -4,6 +4,7 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+import os
 import random
 import time
 from typing import (
@@ -31,6 +32,8 @@ from habitat.datasets import make_dataset
 from habitat.sims import make_sim
 from habitat.tasks.registration import make_task
 from habitat.utils import profiling_wrapper
+from habitat.utils.common import flatten_dict
+from habitat.core.logging import logging, HabitatLogger
 
 if TYPE_CHECKING:
     from omegaconf import DictConfig
@@ -136,6 +139,12 @@ class Env:
         self._episode_start_time: Optional[float] = None
         self._episode_over = False
 
+        self.logger = HabitatLogger(
+            name="habitat_env",
+            level=int(os.environ.get("HABITAT_ENV_LOG", logging.WARNING)),
+            format_str="[%(levelname)s,%(name)s] %(asctime)-15s %(filename)s:%(lineno)d %(message)s",
+        )
+
     def _setup_episode_iterator(self):
         assert self._dataset is not None
         iter_option_dict = {
@@ -238,34 +247,44 @@ class Env:
 
         :return: initial observations from the environment.
         """
-        self._reset_stats()
+        while True:
+            self._reset_stats()
 
-        # Delete the shortest path cache of the current episode
-        # Caching it for the next time we see this episode isn't really worth
-        # it
-        if self._current_episode is not None:
-            self._current_episode._shortest_path_cache = None
+            # Delete the shortest path cache of the current episode
+            # Caching it for the next time we see this episode isn't really worth
+            # it
+            if self._current_episode is not None:
+                self._current_episode._shortest_path_cache = None
 
-        if (
-            self._episode_iterator is not None
-            and self._episode_from_iter_on_reset
-        ):
-            self._current_episode = next(self._episode_iterator)
+            if (
+                self._episode_iterator is not None
+                and self._episode_from_iter_on_reset
+            ):
+                self._current_episode = next(self._episode_iterator)
 
-        # This is always set to true after a reset that way
-        # on the next reset an new episode is taken (if possible)
-        self._episode_from_iter_on_reset = True
-        self._episode_force_changed = False
+            # This is always set to true after a reset that way
+            # on the next reset an new episode is taken (if possible)
+            self._episode_from_iter_on_reset = True
+            self._episode_force_changed = False
 
-        assert self._current_episode is not None, "Reset requires an episode"
-        self.reconfigure(self._config)
+            assert self._current_episode is not None, "Reset requires an episode"
+            self.reconfigure(self._config)
 
-        observations = self.task.reset(episode=self.current_episode)
-        self._task.measurements.reset_measures(
-            episode=self.current_episode,
-            task=self.task,
-            observations=observations,
-        )
+            observations = self.task.reset(episode=self.current_episode)
+            self._task.measurements.reset_measures(
+                episode=self.current_episode,
+                task=self.task,
+                observations=observations,
+            )
+
+            metrics = flatten_dict(self._task.measurements.get_metrics())
+            if not any(np.isinf(value).any() or np.isnan(value).any() for value in metrics.values()):
+                break
+            else:
+                self.logger.warning(
+                    f"Metrics contain np.inf (Scene ID: {self.current_episode.scene_id}, "
+                    f"Episode ID: {self.current_episode.episode_id}), resetting environment."
+                )
 
         return observations
 
