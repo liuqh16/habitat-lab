@@ -793,6 +793,11 @@ class TopDownMapMeasurementConfig(MeasurementConfig):
 
 
 @dataclass
+class TopDownMapCoverageMeasurementConfig(TopDownMapMeasurementConfig):
+    type: str = "TopDownMapCoverage"
+
+
+@dataclass
 class CollisionsMeasurementConfig(MeasurementConfig):
     type: str = "Collisions"
 
@@ -2391,6 +2396,12 @@ cs.store(
     group="habitat/task/measurements",
     name="top_down_map",
     node=TopDownMapMeasurementConfig,
+)
+cs.store(
+    package="habitat.task.measurements.top_down_map_coverage",
+    group="habitat/task/measurements",
+    name="top_down_map_coverage",
+    node=TopDownMapCoverageMeasurementConfig,
 )
 cs.store(
     package="habitat.task.measurements.distance_to_goal",

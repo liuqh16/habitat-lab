@@ -139,10 +139,21 @@ def images_to_video(
         **kwargs,
     )
     logger.info(f"Video created: {os.path.join(output_dir, video_name)}")
+    # Ensure all images have the same shape
+    target_shape = images[-1].shape
+    resized_images = []
+    for im in images:
+        if im.shape != target_shape:
+            resized_im = np.zeros(target_shape, dtype=im.dtype)
+            resized_im[: im.shape[0], : im.shape[1], : im.shape[2]] = im
+            resized_images.append(resized_im)
+        else:
+            resized_images.append(im)
+
     if not verbose:
-        images_iter: List[np.ndarray] = images
+        images_iter: List[np.ndarray] = resized_images
     else:
-        images_iter = tqdm.tqdm(images)  # type: ignore[assignment]
+        images_iter = tqdm.tqdm(resized_images)  # type: ignore[assignment]
     for im in images_iter:
         writer.append_data(im)
     writer.close()
@@ -366,7 +377,7 @@ def overlay_frame(frame, info, additional=None):
     for k, v in flattened_info.items():
         if isinstance(v, str):
             lines.append(f"{k}: {v}")
-        else:
+        elif isinstance(v, float):
             lines.append(f"{k}: {v:.2f}")
     if additional is not None:
         lines.extend(additional)

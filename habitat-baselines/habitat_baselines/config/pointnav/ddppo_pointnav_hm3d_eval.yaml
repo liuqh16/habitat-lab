@@ -3,6 +3,13 @@
 defaults:
   - /benchmark/nav/pointnav: pointnav_hm3d
   - /habitat_baselines: habitat_baselines_rl_config_base
+  - /habitat/task/measurements:
+    - distance_to_goal
+    - success
+    - spl
+    - distance_to_goal_reward
+    - top_down_map
+    - top_down_map_coverage
   - _self_
 
 habitat:
@@ -16,7 +23,7 @@ habitat_baselines:
   torch_gpu_id: 0
   tensorboard_dir: "data/hm3d/debug/tb"
   video_dir: "data/hm3d/debug/videos"
-  test_episode_count: -1
+  test_episode_count: 5
   eval_ckpt_path_dir: "data/hm3d/debug/new_checkpoints"
   num_environments: 4
   checkpoint_folder: "data/hm3d/debug/new_checkpoints"
@@ -24,7 +31,7 @@ habitat_baselines:
   total_num_steps: 2e7
   log_interval: 1
   log_file: "data/hm3d/debug/train.log"
-  num_checkpoints: 100
+  num_checkpoints: 1
   # Force PyTorch to be single threaded as
   # this improves performance considerably
   force_torch_single_threaded: True
@@ -32,6 +39,9 @@ habitat_baselines:
 
   # Costom configs
   reward_free: True
+
+  eval:
+    video_option: [ "disk" ]
 
   rl:
     policy:
