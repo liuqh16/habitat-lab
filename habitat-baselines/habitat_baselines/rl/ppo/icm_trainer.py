@@ -132,8 +132,9 @@ class ICMTrainer(BaseRLTrainer):
                                          num_recurrent_layers=0,
                                          rnn_type='none',
                                          backbone=self.config.habitat_baselines.rl.ddppo.backbone,
-                                         normalize_visual_inputs="rgb" in self._env_spec.observation_space.spaces,
                                          resnet_baseplanes=32,
+                                         normalize_visual_inputs="rgb" in self._env_spec.observation_space.spaces,
+                                         fuse_keys=None,
                                          force_blind_policy=self.config.habitat_baselines.force_blind_policy)
         self.encoder.to(self.device)
 
@@ -143,6 +144,7 @@ class ICMTrainer(BaseRLTrainer):
 
         self.forward_dynamics = ForwardDynamicsNet(num_actions=self._env_spec.action_space.n,
                                                    hidden_dim=self.config.habitat_baselines.rl.ppo.hidden_size)
+        self.forward_dynamics.to(self.device)
 
         self.encoder_optimizer = torch.optim.Adam(self.encoder.parameters(),
                                                   lr=self.config.habitat_baselines.rl.explore.model_learning_rate)
@@ -311,9 +313,9 @@ class ICMTrainer(BaseRLTrainer):
 
         self._agent.rollouts.insert_first_observations(batch)
 
-        self.bonus_buffer = torch.empty(self.envs.num_envs, 1)
         self.current_episode_reward = torch.zeros(self.envs.num_envs, 1)
-        self.current_episode_bonus_reward = torch.zeros(self.envs.num_envs, 1)
+        self.current_episode_bonus_reward = torch.zeros_like(self.current_episode_reward)
+        self.bonus_buffer = torch.zeros_like(self.current_episode_reward)
         self.running_episode_stats = dict(
             count=torch.zeros(self.envs.num_envs, 1),
             reward=torch.zeros(self.envs.num_envs, 1),
@@ -475,12 +477,7 @@ class ICMTrainer(BaseRLTrainer):
             if self.config.habitat_baselines.reward_free:
                 rewards.zero_()
 
-            bonus_rewards = torch.tensor(
-                self.bonus_buffer.squeeze(),
-                dtype=torch.float,
-                device=self.current_episode_reward.device,
-            )
-            bonus_rewards = bonus_rewards.unsqueeze(1)
+            bonus_rewards = self.bonus_buffer.squeeze().clone().detach().unsqueeze(1)
 
             not_done_masks = torch.tensor(
                 [[not done] for done in dones],
@@ -612,8 +609,8 @@ class ICMTrainer(BaseRLTrainer):
             fwd_dynamics_loss += fdm_loss.item()
 
         if self.config.habitat_baselines.rl.explore.model_n_epochs > 0:
-            inv_dynamics_loss /= self.config.RL.explore.model_n_epochs
-            fwd_dynamics_loss /= self.config.RL.explore.model_n_epochs
+            inv_dynamics_loss /= self.config.habitat_baselines.rl.explore.model_n_epochs
+            fwd_dynamics_loss /= self.config.habitat_baselines.rl.explore.model_n_epochs
 
         losses["inv_dynamics_loss"] = inv_dynamics_loss
         losses["fwd_dynamics_loss"] = fwd_dynamics_loss
