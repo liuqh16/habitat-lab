@@ -1,8 +1,8 @@
-TRAINER_NAME=ddppo-e3b  # ddppo|ddppo-icm|ddppo-e3b
+TRAINER_NAME=ddppo-noveld  # ddppo|ddppo-icm|ddppo-e3b|ddppo-rnd|ddppo-noveld
 
 rm -rf data/hm3d/$TRAINER_NAME/train
 
-MAGNUM_LOG=quiet HABITAT_SIM_LOG=quiet CUDA_VISIBLE_DEVICES=1 python -u -m habitat_baselines.run \
+MAGNUM_LOG=quiet HABITAT_SIM_LOG=quiet CUDA_VISIBLE_DEVICES=0 python -u -m habitat_baselines.run \
     --config-name=pointnav/ddppo_pointnav_hm3d.yaml \
     habitat_baselines.trainer_name=$TRAINER_NAME \
     habitat.seed=100 \

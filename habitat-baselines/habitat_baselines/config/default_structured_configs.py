@@ -366,6 +366,11 @@ class ICMConfig(HabitatBaselinesBaseConfig):
 
 
 @dataclass
+class NovelDConfig(HabitatBaselinesBaseConfig):
+    alpha: float = 0.1
+
+
+@dataclass
 class E3BConfig(HabitatBaselinesBaseConfig):
     ridge: float = 0.1
 
@@ -377,6 +382,7 @@ class ExploreConfig(HabitatBaselinesBaseConfig):
     model_n_epochs: int = 3
 
     icm: ICMConfig = ICMConfig()
+    noveld: NovelDConfig = NovelDConfig()
     e3b: E3BConfig = E3BConfig()
 
 

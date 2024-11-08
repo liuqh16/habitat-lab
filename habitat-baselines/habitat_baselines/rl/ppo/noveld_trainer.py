@@ -71,11 +71,11 @@ from habitat_baselines.utils.info_dict import (
 from habitat_baselines.utils.timing import g_timer
 
 
-@baseline_registry.register_trainer(name="ddppo-e3b")
+@baseline_registry.register_trainer(name="ddppo-noveld")
 @baseline_registry.register_trainer(name="ppo")
-class E3BTrainer(BaseRLTrainer):
-    r"""Trainer class for PPO algorithm with E3B.
-    Paper: http://arxiv.org/abs/2210.05805.
+class NovelDTrainer(BaseRLTrainer):
+    r"""Trainer class for PPO algorithm with NovelD.
+    Paper: https://proceedings.neurips.cc/paper/2021/hash/d428d070622e0f4363fceae11f4a3576-Abstract.html.
     """
     supported_tasks = ["Nav-v0"]
 
@@ -125,26 +125,32 @@ class E3BTrainer(BaseRLTrainer):
 
         self._create_obs_transforms()
 
-        self.encoder = PointNavResNetNet(observation_space=self._env_spec.observation_space,
-                                         action_space=None,
-                                         hidden_size=self.config.habitat_baselines.rl.ppo.hidden_size,
-                                         num_recurrent_layers=0,
-                                         rnn_type='none',
-                                         backbone=self.config.habitat_baselines.rl.ddppo.backbone,
-                                         resnet_baseplanes=32,
-                                         normalize_visual_inputs="rgb" in self._env_spec.observation_space.spaces,
-                                         fuse_keys=None,
-                                         force_blind_policy=self.config.habitat_baselines.force_blind_policy)
-        self.encoder.to(self.device)
+        self.predictor_net = PointNavResNetNet(observation_space=self._env_spec.observation_space,
+                                               action_space=None,
+                                               hidden_size=self.config.habitat_baselines.rl.ppo.hidden_size,
+                                               num_recurrent_layers=0,
+                                               rnn_type='none',
+                                               backbone=self.config.habitat_baselines.rl.ddppo.backbone,
+                                               resnet_baseplanes=32,
+                                               normalize_visual_inputs="rgb" in self._env_spec.observation_space.spaces,
+                                               fuse_keys=None,
+                                               force_blind_policy=self.config.habitat_baselines.force_blind_policy)
+        self.predictor_net.to(self.device)
 
-        self.inverse_dynamics = InverseDynamicsNet(num_actions=self._env_spec.action_space.n,
-                                                   emb_size=self.config.habitat_baselines.rl.ppo.hidden_size)
-        self.inverse_dynamics.to(self.device)
+        self.target_net = PointNavResNetNet(observation_space=self._env_spec.observation_space,
+                                            action_space=None,
+                                            hidden_size=self.config.habitat_baselines.rl.ppo.hidden_size,
+                                            num_recurrent_layers=0,
+                                            rnn_type='none',
+                                            backbone=self.config.habitat_baselines.rl.ddppo.backbone,
+                                            resnet_baseplanes=32,
+                                            normalize_visual_inputs="rgb" in self._env_spec.observation_space.spaces,
+                                            fuse_keys=None,
+                                            force_blind_policy=self.config.habitat_baselines.force_blind_policy)
+        self.target_net.to(self.device)
 
-        self.encoder_optimizer = torch.optim.Adam(self.encoder.parameters(),
-                                                  lr=self.config.habitat_baselines.rl.explore.model_learning_rate)
-        self.inverse_dynamics_optimizer = torch.optim.Adam(self.inverse_dynamics.parameters(),
-                                                           lr=self.config.habitat_baselines.rl.explore.model_learning_rate)
+        self.predictor_net_optimizer = torch.optim.Adam(self.predictor_net.parameters(),
+                                                        lr=self.config.habitat_baselines.rl.explore.model_learning_rate)
 
         return baseline_registry.get_agent_access_mgr(
             self.config.habitat_baselines.rl.agent.type
@@ -316,15 +322,12 @@ class E3BTrainer(BaseRLTrainer):
             lambda: deque(maxlen=self._ppo_cfg.reward_window_size)
         )
 
-        # E3B objects
+        # NovelD objects
         self.current_episode_bonus_reward = torch.zeros_like(self.current_episode_reward)
-        self.elliptical_bonus_buffer = torch.zeros_like(self.current_episode_reward)
-
-        ridge = self.config.habitat_baselines.rl.explore.e3b.ridge
-        hidden_size = self.config.habitat_baselines.rl.ppo.hidden_size
-        self.inverse_covs = torch.stack([torch.eye(hidden_size) * (1. / ridge) \
-                                         for i in range(self.envs.num_envs)]).to(self.device)
-        self.outer_product_buffers = torch.empty(self.envs.num_envs, hidden_size, hidden_size).to(self.device)
+        self.rnd_error_buffer = torch.zeros_like(self.current_episode_reward)
+        self.prev_rnd_error_buffer = torch.zeros_like(self.current_episode_reward)
+        self.indicator_buffer = torch.zeros_like(self.current_episode_reward)
+        self.episodic_state_count_dicts = [defaultdict(lambda: 0) for _ in range(self.envs.num_envs)]
 
         self.t_start = time.time()
 
@@ -407,13 +410,22 @@ class E3BTrainer(BaseRLTrainer):
             )
 
             # Compute intrinsic reward bonus
-            phi = self.encoder(step_batch["observations"], None, None, None, None)[0]
-            u = torch.bmm(phi.unsqueeze(1), self.inverse_covs)
-            elliptical_bonus = torch.bmm(u, phi.unsqueeze(2))
-            torch.bmm(u.permute(0, 2, 1), u, out=self.outer_product_buffers)
-            torch.mul(self.outer_product_buffers, -1./(1. + elliptical_bonus), out=self.outer_product_buffers)
-            torch.add(self.inverse_covs, self.outer_product_buffers, out=self.inverse_covs)
-            self.elliptical_bonus_buffer.copy_(elliptical_bonus[:, 0])
+            for i in range(self.envs.num_envs):
+                state_key = ()
+                for k in step_batch["observations"].keys():
+                    if k in ["compass", "gps"]:
+                        state_key += tuple(step_batch["observations"][k][i].cpu().view(-1).tolist())
+                    elif k in ["rgb", "depth"]:
+                        # for images, subsample to speed up, otherwise it's very slow
+                        state_key += tuple(step_batch["observations"][k][i].cpu().view(-1)[::1000].tolist())
+                self.episodic_state_count_dicts[i][state_key] += 1
+                self.indicator_buffer[i] = self.episodic_state_count_dicts[i][state_key] == 1
+
+            target = self.target_net(step_batch["observations"], None, None, None, None)[0]
+            pred = self.predictor_net(step_batch["observations"], None, None, None, None)[0]
+            rnd_error = torch.norm(pred - target, dim=-1, p=2)
+            self.prev_rnd_error_buffer.copy_(self.rnd_error_buffer)
+            self.rnd_error_buffer.copy_(rnd_error.unsqueeze(1))
 
         profiling_wrapper.range_pop()  # compute actions
 
@@ -476,7 +488,8 @@ class E3BTrainer(BaseRLTrainer):
             if self.config.habitat_baselines.reward_free:
                 rewards.zero_()
 
-            bonus_rewards = self.elliptical_bonus_buffer.squeeze().clone().detach().unsqueeze(1)
+            rnd_error_diff = self.rnd_error_buffer - self.config.habitat_baselines.rl.explore.noveld.alpha * self.prev_rnd_error_buffer
+            bonus_rewards = (self.indicator_buffer * torch.clamp(rnd_error_diff, min=0.0)).squeeze().clone().detach().unsqueeze(1)
 
             not_done_masks = torch.tensor(
                 [[not done] for done in dones],
@@ -521,10 +534,11 @@ class E3BTrainer(BaseRLTrainer):
                 done_masks, 0.0
             )
 
-            # Reset covariance matrices for finished episodes
+            # Reset state counts
             for i, done in enumerate(dones):
                 if done:
-                    self.inverse_covs[i].copy_(torch.eye(self.inverse_covs.size(1)) * (1. / self.config.habitat_baselines.rl.explore.e3b.ridge))
+                    self.episodic_state_count_dicts[i] = defaultdict(lambda: 0)
+                    self.prev_rnd_error_buffer.zero_()
 
             # Add intrinsic and extrinsic rewards together
             rewards = rewards + self.config.habitat_baselines.rl.explore.int_rew_coef * bonus_rewards
@@ -581,28 +595,26 @@ class E3BTrainer(BaseRLTrainer):
 
         losses = self._agent.updater.update(self._agent.rollouts)
 
-        # E3B stuff
-        inv_dynamics_loss = 0
+        # RND stuff
+        rnd_loss = 0
         for i in range(self.config.habitat_baselines.rl.explore.model_n_epochs):
 
-            self.encoder_optimizer.zero_grad()
-            self.inverse_dynamics_optimizer.zero_grad()
+            # Compute IDM loss
+            self.predictor_net_optimizer.zero_grad()
             obs, action, next_obs = self._agent.rollouts.sample_triplet()
-            phi = self.encoder(obs, None, None, None, None)[0]
-            next_phi = self.encoder(next_obs, None, None, None, None)[0]
-            action_pred = F.log_softmax(self.inverse_dynamics(phi, next_phi), dim=-1)
-            loss = F.nll_loss(action_pred, action.squeeze())
+            with torch.no_grad():
+                target = self.target_net(obs, None, None, None, None)[0]
+            pred = self.predictor_net(obs, None, None, None, None)[0]
+            loss = F.mse_loss(pred, target)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.encoder.parameters(), self.config.habitat_baselines.rl.ppo.max_grad_norm)
-            torch.nn.utils.clip_grad_norm_(self.inverse_dynamics.parameters(), self.config.habitat_baselines.rl.ppo.max_grad_norm)
-            self.encoder_optimizer.step()
-            self.inverse_dynamics_optimizer.step()
-            inv_dynamics_loss += loss.item()
+            torch.nn.utils.clip_grad_norm_(self.predictor_net.parameters(), self.config.habitat_baselines.rl.ppo.max_grad_norm)
+            self.predictor_net_optimizer.step()
+            rnd_loss += loss.item()
 
         if self.config.habitat_baselines.rl.explore.model_n_epochs > 0:
-            inv_dynamics_loss /= self.config.habitat_baselines.rl.explore.model_n_epochs
+            rnd_loss /= self.config.habitat_baselines.rl.explore.model_n_epochs
 
-        losses["inv_dynamics_loss"] = inv_dynamics_loss
+        losses["rnd_loss"] = rnd_loss
 
         self._agent.rollouts.after_update()
         self._agent.after_update()
