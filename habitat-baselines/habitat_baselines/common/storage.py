@@ -45,7 +45,10 @@ class Storage(abc.ABC):
     def after_update(self) -> None:
         pass
 
-    def sample_triplet(self):
+    def sample_triplet(self, use_future_state: bool = False):
+        pass
+
+    def compute_future_states(self, discount: float = 0.99):
         pass
 
     def get_last_step(self):

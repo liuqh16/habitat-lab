@@ -138,7 +138,7 @@ class E3BTrainer(BaseRLTrainer):
         self.encoder.to(self.device)
 
         self.inverse_dynamics = InverseDynamicsNet(num_actions=self._env_spec.action_space.n,
-                                                   emb_size=self.config.habitat_baselines.rl.ppo.hidden_size)
+                                                   hidden_size=self.config.habitat_baselines.rl.ppo.hidden_size)
         self.inverse_dynamics.to(self.device)
 
         self.encoder_optimizer = torch.optim.Adam(self.encoder.parameters(),

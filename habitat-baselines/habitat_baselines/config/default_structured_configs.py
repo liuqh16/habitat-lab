@@ -376,6 +376,17 @@ class E3BConfig(HabitatBaselinesBaseConfig):
 
 
 @dataclass
+class TDDConfig(HabitatBaselinesBaseConfig):
+    aggregate_fn: str = "min"
+    energy_fn: str = "mrn_pot"
+    loss_fn: str = "infonce"
+    discount: float = 0.99
+    temperature: float = 1.0
+    logsumexp_coef: float = 0.1
+    knn_k: int = 10
+
+
+@dataclass
 class ExploreConfig(HabitatBaselinesBaseConfig):
     int_rew_coef: float = 0.1
     model_learning_rate: float = 2.5e-4
@@ -384,6 +395,7 @@ class ExploreConfig(HabitatBaselinesBaseConfig):
     icm: ICMConfig = ICMConfig()
     noveld: NovelDConfig = NovelDConfig()
     e3b: E3BConfig = E3BConfig()
+    tdd: TDDConfig = TDDConfig()
 
 
 @dataclass

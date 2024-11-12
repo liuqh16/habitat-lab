@@ -8,5 +8,8 @@ from .resnet_policy import (  # noqa: F401.
     PointNavResNetNet,
     InverseDynamicsNet,
     ForwardDynamicsNet,
+    ProjectionNet,
+    ContrastiveNet,
+    QuasimetricNet,
     PointNavResNetPolicy,
 )

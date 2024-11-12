@@ -52,8 +52,7 @@ if TYPE_CHECKING:
 
 from habitat_baselines.rl.ddppo.policy import (
     PointNavResNetNet,
-    InverseDynamicsNet,
-    ForwardDynamicsNet,
+    ProjectionNet,
 )
 from habitat_baselines.rl.ppo.agent_access_mgr import AgentAccessMgr
 from habitat_baselines.rl.ppo.evaluator import Evaluator
@@ -72,11 +71,19 @@ from habitat_baselines.utils.info_dict import (
 from habitat_baselines.utils.timing import g_timer
 
 
-@baseline_registry.register_trainer(name="ddppo-icm")
+def mrn_distance(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    # Metric Residual Network (MRN) architecture (https://arxiv.org/pdf/2208.08133)
+    x_prefix, x_suffix = x.chunk(2, dim=-1)
+    y_prefix, y_suffix = y.chunk(2, dim=-1)
+    max_component = (x_prefix - y_prefix).relu().max(dim=-1).values
+    l2_component = ((x_suffix - y_suffix).pow(2).sum(dim=-1) + eps).sqrt()
+    return max_component + l2_component
+
+
+@baseline_registry.register_trainer(name="ddppo-tdd")
 @baseline_registry.register_trainer(name="ppo")
-class ICMTrainer(BaseRLTrainer):
-    r"""Trainer class for PPO algorithm with ICM.
-    Paper: https://arxiv.org/abs/1705.05363.
+class TDDTrainer(BaseRLTrainer):
+    r"""Trainer class for PPO algorithm with TDD.
     """
     supported_tasks = ["Nav-v0"]
 
@@ -126,32 +133,31 @@ class ICMTrainer(BaseRLTrainer):
 
         self._create_obs_transforms()
 
-        self.encoder = PointNavResNetNet(observation_space=self._env_spec.observation_space,
-                                         action_space=None,
-                                         hidden_size=self.config.habitat_baselines.rl.ppo.hidden_size,
-                                         num_recurrent_layers=0,
-                                         rnn_type='none',
-                                         backbone=self.config.habitat_baselines.rl.ddppo.backbone,
-                                         resnet_baseplanes=32,
-                                         normalize_visual_inputs="rgb" in self._env_spec.observation_space.spaces,
-                                         fuse_keys=None,
-                                         force_blind_policy=self.config.habitat_baselines.force_blind_policy)
+        self.feat_extractor = PointNavResNetNet(observation_space=self._env_spec.observation_space,
+                                                action_space=None,
+                                                hidden_size=self.config.habitat_baselines.rl.ppo.hidden_size,
+                                                num_recurrent_layers=0,
+                                                rnn_type='none',
+                                                backbone=self.config.habitat_baselines.rl.ddppo.backbone,
+                                                resnet_baseplanes=32,
+                                                normalize_visual_inputs="rgb" in self._env_spec.observation_space.spaces,
+                                                fuse_keys=None,
+                                                force_blind_policy=self.config.habitat_baselines.force_blind_policy)
+        self.feat_extractor.to(self.device)
+
+        self.encoder = ProjectionNet(input_size=self.config.habitat_baselines.rl.ppo.hidden_size,
+                                     output_size=self.config.habitat_baselines.rl.ppo.hidden_size)
         self.encoder.to(self.device)
 
-        self.inverse_dynamics = InverseDynamicsNet(num_actions=self._env_spec.action_space.n,
-                                                   hidden_size=self.config.habitat_baselines.rl.ppo.hidden_size)
-        self.inverse_dynamics.to(self.device)
+        self.potential = ProjectionNet(input_size=self.config.habitat_baselines.rl.ppo.hidden_size,
+                                       output_size=1)
+        self.potential.to(self.device)
 
-        self.forward_dynamics = ForwardDynamicsNet(num_actions=self._env_spec.action_space.n,
-                                                   hidden_size=self.config.habitat_baselines.rl.ppo.hidden_size)
-        self.forward_dynamics.to(self.device)
-
-        self.encoder_optimizer = torch.optim.Adam(self.encoder.parameters(),
-                                                  lr=self.config.habitat_baselines.rl.explore.model_learning_rate)
-        self.inverse_dynamics_optimizer = torch.optim.Adam(self.inverse_dynamics.parameters(),
-                                                           lr=self.config.habitat_baselines.rl.explore.model_learning_rate)
-        self.forward_dynamics_optimizer = torch.optim.Adam(self.forward_dynamics.parameters(),
-                                                           lr=self.config.habitat_baselines.rl.explore.model_learning_rate)
+        self.model_optimizer = torch.optim.Adam([
+                {"params": self.feat_extractor.parameters()},
+                {"params": self.encoder.parameters()},
+                {"params": self.potential.parameters()},
+            ], lr=self.config.habitat_baselines.rl.explore.model_learning_rate)
 
         return baseline_registry.get_agent_access_mgr(
             self.config.habitat_baselines.rl.agent.type
@@ -323,9 +329,10 @@ class ICMTrainer(BaseRLTrainer):
             lambda: deque(maxlen=self._ppo_cfg.reward_window_size)
         )
 
-        # ICM objects
+        # TDD objects
         self.current_episode_bonus_reward = torch.zeros_like(self.current_episode_reward)
-        self.bonus_buffer = torch.zeros_like(self.current_episode_reward)
+        self.reward_bonus_buffer = torch.zeros_like(self.current_episode_reward)
+        self.obs_embedding_buffer = [None for _ in range(self.envs.num_envs)]
 
         self.t_start = time.time()
 
@@ -412,11 +419,49 @@ class ICMTrainer(BaseRLTrainer):
             )
 
             # Compute intrinsic reward bonus
-            phi = self.encoder(step_batch["observations"], None, None, None, None)[0]
-            pred_next_phi = self.forward_dynamics(phi, step_batch["actions"])
-            next_phi = self.encoder(next_step_batch["observations"], None, None, None, None)[0]
-            bonus = F.mse_loss(pred_next_phi, next_phi, reduction="none").mean(1)
-            self.bonus_buffer.copy_(bonus.unsqueeze(1))
+            curr_obs_embs: torch.Tensor = self.feat_extractor(step_batch["observations"], None, None, None, None)[0]
+            next_obs_embs: torch.Tensor = self.feat_extractor(next_step_batch["observations"], None, None, None, None)[0]
+
+            for index_env, curr_obs_emb, next_obs_emb in zip(
+                range(env_slice.start, env_slice.stop),
+                curr_obs_embs.unbind(0),
+                next_obs_embs.unbind(0),
+            ):
+                # Update historical observation embeddings
+                obs_embs = self.obs_embedding_buffer[index_env]
+                if obs_embs is None:
+                    obs_embs = torch.stack([curr_obs_emb, next_obs_emb], dim=0)
+                else:
+                    obs_embs = torch.cat([obs_embs, next_obs_emb.unsqueeze(0)], dim=0)
+                self.obs_embedding_buffer[index_env] = obs_embs
+
+                # Compute dists
+                phi_x: torch.Tensor = self.encoder(obs_embs[:-1])
+                phi_y: torch.Tensor = self.encoder(obs_embs[-1:])
+                if self.config.habitat_baselines.rl.explore.tdd.energy_fn == "l2":
+                    dists = torch.sqrt((phi_x[:, None, :] - phi_y[None, :, :]).pow(2).sum(dim=-1) + 1e-8)
+                elif self.config.habitat_baselines.rl.explore.tdd.energy_fn == "cos":
+                    phi_x_norm = F.normalize(phi_x, p=2, dim=-1) / self.config.habitat_baselines.rl.explore.tdd.temperature
+                    phi_y_norm = F.normalize(phi_y, p=2, dim=-1)
+                    dists = - torch.einsum("ik,jk->ij", phi_x_norm, phi_y_norm)
+                elif self.config.habitat_baselines.rl.explore.tdd.energy_fn == "dot":
+                    dists = - torch.einsum("ik,jk->ij", phi_x, phi_y)
+                elif "mrn" in self.config.habitat_baselines.rl.explore.tdd.energy_fn:
+                    dists = mrn_distance(phi_x[:, None, :], phi_y[None, :, :])
+                else:
+                    raise NotImplementedError
+
+                # Compute intrinsic reward
+                if self.config.habitat_baselines.rl.explore.tdd.aggregate_fn == "min":
+                    self.reward_bonus_buffer[index_env].copy_(dists.min(), non_blocking=True)
+                elif self.config.habitat_baselines.rl.explore.tdd.aggregate_fn == "quantile10":
+                    self.reward_bonus_buffer[index_env].copy_(dists.quantile(q=0.1), non_blocking=True)
+                elif self.config.habitat_baselines.rl.explore.tdd.aggregate_fn == "knn":
+                    knn_dists = dists if dists.size(0) <= self.config.habitat_baselines.rl.explore.tdd.knn_k \
+                        else dists.topk(k=self.config.habitat_baselines.rl.explore.tdd.knn_k, largest=False).values
+                    self.reward_bonus_buffer[index_env].copy_(knn_dists[-1], non_blocking=True)
+                else:
+                    raise NotImplementedError
 
         profiling_wrapper.range_pop()  # compute actions
 
@@ -479,7 +524,7 @@ class ICMTrainer(BaseRLTrainer):
             if self.config.habitat_baselines.reward_free:
                 rewards.zero_()
 
-            bonus_rewards = self.bonus_buffer.squeeze().clone().detach().unsqueeze(1)
+            bonus_rewards = self.reward_bonus_buffer.squeeze().clone().detach().unsqueeze(1)
 
             not_done_masks = torch.tensor(
                 [[not done] for done in dones],
@@ -523,6 +568,11 @@ class ICMTrainer(BaseRLTrainer):
             self.current_episode_bonus_reward[env_slice].masked_fill_(
                 done_masks, 0.0
             )
+
+            # Reset episodic obs-embedding buffer
+            for index_env, done in zip(range(env_slice.start, env_slice.stop), dones):
+                if done:
+                    self.obs_embedding_buffer[index_env] = None
 
             # Add intrinsic and extrinsic rewards together
             rewards = rewards + self.config.habitat_baselines.rl.explore.int_rew_coef * bonus_rewards
@@ -579,43 +629,76 @@ class ICMTrainer(BaseRLTrainer):
 
         losses = self._agent.updater.update(self._agent.rollouts)
 
-        # ICM stuff
-        inv_dynamics_loss, fwd_dynamics_loss = 0, 0
+        # TDD stuff
+        self._agent.rollouts.compute_future_states(discount=self.config.habitat_baselines.rl.explore.tdd.discount)
+        contrastive_loss, logits_logsumexp = 0, 0
+        logits_pos, logits_neg, categorical_accuracy = 0, 0, 0
         for i in range(self.config.habitat_baselines.rl.explore.model_n_epochs):
 
-            # Compute IDM loss
-            self.encoder_optimizer.zero_grad()
-            self.inverse_dynamics_optimizer.zero_grad()
-            self.forward_dynamics_optimizer.zero_grad()
-            obs, action, next_obs = self._agent.rollouts.sample_triplet()
-            phi = self.encoder(obs, None, None, None, None)[0]
-            next_phi = self.encoder(next_obs, None, None, None, None)[0]
-            action_pred = F.log_softmax(self.inverse_dynamics(phi, next_phi), dim=-1)
-            idm_loss = F.nll_loss(action_pred, action.squeeze())
+            # Compute contrastive loss
+            self.model_optimizer.zero_grad()
+            obs, action, next_obs = self._agent.rollouts.sample_triplet(use_future_state=True)
+            curr_obs_embs = self.feat_extractor(obs, None, None, None, None)[0]
+            next_obs_embs = self.feat_extractor(next_obs, None, None, None, None)[0]
+            phi_x: torch.Tensor = self.encoder(curr_obs_embs)
+            phi_y: torch.Tensor = self.encoder(next_obs_embs)
+            c_y: torch.Tensor = self.potential(next_obs_embs)
 
-            # Compute FDM loss
-            pred_next_phi = self.forward_dynamics(phi, action)
-            fdm_loss = F.mse_loss(pred_next_phi, next_phi)
+            if self.config.habitat_baselines.rl.explore.tdd.energy_fn == "l2":
+                logits = -torch.sqrt((phi_x[:, None, :] - phi_y[None, :, :]).pow(2).sum(dim=-1) + 1e-8)
+            elif self.config.habitat_baselines.rl.explore.tdd.energy_fn == "cos":
+                phi_x_norm = F.normalize(phi_x, p=2, dim=-1) / self.config.habitat_baselines.rl.explore.tdd.temperature
+                phi_y_norm = F.normalize(phi_y, p=2, dim=-1)
+                logits = torch.einsum("ik,jk->ij", phi_x_norm, phi_y_norm)
+            elif self.config.habitat_baselines.rl.explore.tdd.energy_fn == "dot":
+                logits = torch.einsum("ik,jk->ij", phi_x, phi_y)
+            elif self.config.habitat_baselines.rl.explore.tdd.energy_fn == "mrn":
+                logits = - mrn_distance(phi_x[:, None, :], phi_y[None, :, :])
+            elif self.config.habitat_baselines.rl.explore.tdd.energy_fn == "mrn_pot":
+                logits = c_y - mrn_distance(phi_x[:, None, :], phi_y[None, :, :])
+            else:
+                raise NotImplementedError
 
-            loss = idm_loss * (1 - self.config.habitat_baselines.rl.explore.icm.forward_loss_coef) + \
-                   fdm_loss * self.config.habitat_baselines.rl.explore.icm.forward_loss_coef
+            batch_size = logits.size(0)
+            I = torch.eye(batch_size, device=logits.device)
+            if self.config.habitat_baselines.rl.explore.tdd.loss_fn == "infonce":
+                contrast_loss = F.cross_entropy(logits, I).mean()
+            elif self.config.habitat_baselines.rl.explore.tdd.loss_fn == "infonce_backward":
+                contrast_loss = F.cross_entropy(logits.T, I).mean()
+            elif self.config.habitat_baselines.rl.explore.tdd.loss_fn == "infonce_symmetric":
+                contrast_loss = ((F.cross_entropy(logits, I) + F.cross_entropy(logits.T, I)) / 2).mean()
+            elif self.config.habitat_baselines.rl.explore.tdd.loss_fn == "dpo":
+                positive = torch.diag(logits)
+                diffs = positive[:, None] - logits
+                contrast_loss = -F.logsigmoid(diffs).mean()
+            else:
+                raise NotImplementedError
+            logsumexp_loss = (torch.logsumexp(logits + 1e-6, dim=1).pow(2)).mean()
+            loss = contrast_loss + self.config.habitat_baselines.rl.explore.tdd.logsumexp_coef * logsumexp_loss
 
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.feat_extractor.parameters(), self.config.habitat_baselines.rl.ppo.max_grad_norm)
             torch.nn.utils.clip_grad_norm_(self.encoder.parameters(), self.config.habitat_baselines.rl.ppo.max_grad_norm)
-            torch.nn.utils.clip_grad_norm_(self.inverse_dynamics.parameters(), self.config.habitat_baselines.rl.ppo.max_grad_norm)
-            torch.nn.utils.clip_grad_norm_(self.forward_dynamics.parameters(), self.config.habitat_baselines.rl.ppo.max_grad_norm)
-            self.encoder_optimizer.step()
-            self.inverse_dynamics_optimizer.step()
-            self.forward_dynamics_optimizer.step()
-            inv_dynamics_loss += idm_loss.item()
-            fwd_dynamics_loss += fdm_loss.item()
+            torch.nn.utils.clip_grad_norm_(self.potential.parameters(), self.config.habitat_baselines.rl.ppo.max_grad_norm)
+            self.model_optimizer.step()
+            contrastive_loss += contrast_loss.item()
+            logits_logsumexp += logsumexp_loss.item()
+            logits_pos += logits.diag().mean().item()
+            logits_neg += logits[~I.bool()].mean().item()
+            categorical_accuracy += (logits.argmax(dim=1) == torch.arange(batch_size, device=logits.device)).float().mean().item()
 
         if self.config.habitat_baselines.rl.explore.model_n_epochs > 0:
-            inv_dynamics_loss /= self.config.habitat_baselines.rl.explore.model_n_epochs
-            fwd_dynamics_loss /= self.config.habitat_baselines.rl.explore.model_n_epochs
+            contrastive_loss /= self.config.habitat_baselines.rl.explore.model_n_epochs
+            logits_logsumexp /= self.config.habitat_baselines.rl.explore.model_n_epochs
+            logits_pos /= self.config.habitat_baselines.rl.explore.model_n_epochs
+            logits_neg /= self.config.habitat_baselines.rl.explore.model_n_epochs
+            categorical_accuracy /= self.config.habitat_baselines.rl.explore.model_n_epochs
 
-        losses["inv_dynamics_loss"] = inv_dynamics_loss
-        losses["fwd_dynamics_loss"] = fwd_dynamics_loss
+        losses["contrastive_loss"] = contrastive_loss
+        losses["logits_logsumexp"] = logits_logsumexp
+        losses["logits_pos"] = logits_pos
+        losses["logits_neg"] = logits_neg
+        losses["categorical_accuracy"] = categorical_accuracy
 
         self._agent.rollouts.after_update()
         self._agent.after_update()

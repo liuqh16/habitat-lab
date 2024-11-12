@@ -39,6 +39,7 @@ class RolloutStorage(Storage):
 
         self.buffers = TensorDict()
         self.buffers["observations"] = TensorDict()
+        self.buffers["future_observations"] = TensorDict()
 
         for sensor in observation_space.spaces:
             self.buffers["observations"][sensor] = torch.from_numpy(
@@ -51,6 +52,7 @@ class RolloutStorage(Storage):
                     dtype=observation_space.spaces[sensor].dtype,
                 )
             )
+            self.buffers["future_observations"][sensor] = torch.zeros_like(self.buffers["observations"][sensor])
 
         self.buffers["recurrent_hidden_states"] = torch.zeros(
             numsteps + 1,
@@ -205,19 +207,43 @@ class RolloutStorage(Storage):
                     + self.buffers["rewards"][step]
                 )
 
-    def sample_triplet(self):
+    def sample_triplet(self, use_future_state: bool = False):
         index = random.randint(0, self.num_steps - 1)
         obs = dict()
         for k, v in self.buffers["observations"].items():
             obs[k] = v[index]
 
         next_obs = dict()
-        for k, v in self.buffers["observations"].items():
-            next_obs[k] = v[index + 1]
+        if not use_future_state:
+            for k, v in self.buffers["observations"].items():
+                next_obs[k] = v[index + 1]
+        else:
+            for k, v in self.buffers["future_observations"].items():
+                next_obs[k] = v[index]
 
         action = self.buffers["actions"][index]
 
         return obs, action, next_obs
+
+    def compute_future_states(self, discount: float = 0.99):
+        T, N = self.num_steps, self._num_envs
+        ranges = np.full((T, N), T, dtype=np.int64)
+        last_one = np.full((N,), T, dtype=np.int64)
+        dones = ~(self.buffers["masks"][1:].bool().cpu().numpy().squeeze(-1))
+        for t in reversed(range(T)):
+            ranges[t] = last_one - (t + 1)
+            last_one = np.where(dones[t], t, last_one)
+        seeds = np.random.rand(*ranges.shape)
+        if discount == 0:
+            intervals = np.ones_like(ranges)
+        elif discount == 1:
+            intervals = np.ceil(seeds * ranges).astype(np.int64)
+        else:
+            intervals = np.ceil(np.log(1 - (1 - discount ** ranges) * seeds) / np.log(discount)).astype(np.int64)
+        intervals = np.minimum(intervals, ranges)
+        for k in self.buffers["observations"].keys():
+            self.buffers["future_observations"][k][:T] = \
+                self.buffers["observations"][k][intervals + np.arange(T)[:, None], np.arange(N)]
 
     def data_generator(
         self,

@@ -398,23 +398,21 @@ def init(module, weight_init, bias_init, gain=1):
 
 
 class InverseDynamicsNet(nn.Module):
-    def __init__(self, num_actions, emb_size=512, p_dropout=0.0):
+    def __init__(self, num_actions, hidden_size=512, p_dropout=0.0):
         super(InverseDynamicsNet, self).__init__()
         self.num_actions = num_actions 
-        
+
         init_ = lambda m: init(m, nn.init.orthogonal_, lambda x: nn.init.
                             constant_(x, 0), nn.init.calculate_gain('relu'))
         self.inverse_dynamics = nn.Sequential(
-            init_(nn.Linear(2 * emb_size, 256)), 
+            init_(nn.Linear(2 * hidden_size, 256)),
             nn.ReLU(),
             nn.Dropout(p=p_dropout)
         )
-
-        init_ = lambda m: init(m, nn.init.orthogonal_, 
+        init_ = lambda m: init(m, nn.init.orthogonal_,
             lambda x: nn.init.constant_(x, 0))
         self.id_out = init_(nn.Linear(256, self.num_actions))
 
-        
     def forward(self, state_embedding, next_state_embedding):
         inputs = torch.cat((state_embedding, next_state_embedding), dim=1)
         action_logits = self.id_out(self.inverse_dynamics(inputs))
@@ -422,22 +420,19 @@ class InverseDynamicsNet(nn.Module):
 
 
 class ForwardDynamicsNet(nn.Module):
-    def __init__(self, num_actions, hidden_dim=1024):
+    def __init__(self, num_actions, hidden_size=512):
         super(ForwardDynamicsNet, self).__init__()
         self.num_actions = num_actions 
 
         init_ = lambda m: init(m, nn.init.orthogonal_, lambda x: nn.init.
                             constant_(x, 0), nn.init.calculate_gain('relu'))
-    
         self.forward_dynamics = nn.Sequential(
-            init_(nn.Linear(hidden_dim + self.num_actions, hidden_dim)), 
-            nn.ReLU(), 
+            init_(nn.Linear(hidden_size + self.num_actions, hidden_size)),
+            nn.ReLU(),
         )
-
-        init_ = lambda m: init(m, nn.init.orthogonal_, 
+        init_ = lambda m: init(m, nn.init.orthogonal_,
             lambda x: nn.init.constant_(x, 0))
-
-        self.fd_out = init_(nn.Linear(hidden_dim, hidden_dim))
+        self.fd_out = init_(nn.Linear(hidden_size, hidden_size))
 
     def forward(self, state_embedding, action):
         action = action.squeeze()
@@ -445,6 +440,88 @@ class ForwardDynamicsNet(nn.Module):
         inputs = torch.cat((state_embedding, action_one_hot), dim=1)
         next_state_emb = self.fd_out(self.forward_dynamics(inputs))
         return next_state_emb
+
+
+class ProjectionNet(nn.Module):
+    def __init__(self, input_size=512, output_size=512):
+        super(ProjectionNet, self).__init__()
+
+        init_ = lambda m: init(m, nn.init.orthogonal_, lambda x: nn.init.
+                            constant_(x, 0), nn.init.calculate_gain('relu'))
+        modules = [
+            init_(nn.Linear(input_size, input_size)),
+            nn.ReLU(),
+        ]
+        init_ = lambda m: init(m, nn.init.orthogonal_,
+            lambda x: nn.init.constant_(x, 0))
+        modules += [init_(nn.Linear(input_size, output_size))]
+        self.nn = nn.Sequential(*modules)
+
+    def forward(self, state_embedding):
+        return self.nn(state_embedding)
+
+
+class ContrastiveNet(nn.Module):
+    def __init__(self, hidden_size=512, temperature=1, adap_temperature=False):
+        super(ContrastiveNet, self).__init__()
+        self.temperature = temperature
+        self.adap_temperature = adap_temperature
+
+        init_ = lambda m: init(m, nn.init.orthogonal_, lambda x: nn.init.
+                            constant_(x, 0), nn.init.calculate_gain('relu'))
+        modules = [
+            init_(nn.Linear(hidden_size, hidden_size)),
+            nn.ReLU(),
+        ]
+        init_ = lambda m: init(m, nn.init.orthogonal_,
+            lambda x: nn.init.constant_(x, 0))
+        modules += [init_(nn.Linear(hidden_size, hidden_size))]
+        self.g_mlp = nn.Sequential(*modules)
+        self.s_mlp = nn.Sequential(*modules)
+
+        if self.adap_temperature:
+            self.log_temp = nn.Parameter(torch.tensor([0.0], requires_grad=True))
+
+    def forward(self, obs: torch.Tensor, goal: torch.Tensor):
+        s_repr = self.s_mlp(obs)
+        g_repr = self.g_mlp(goal)
+
+        s_repr = s_repr / (torch.linalg.norm(s_repr, axis=1, keepdims=True) + 1e-8)
+        g_repr = g_repr / (torch.linalg.norm(g_repr, axis=1, keepdims=True) + 1e-8)
+        
+        if self.adap_temperature:
+            s_repr = s_repr / torch.exp(self.log_temp)
+        else:
+            s_repr = s_repr / self.temperature
+        outer = torch.einsum('ik,jk->ij', s_repr, g_repr)
+        return outer, s_repr, g_repr
+
+
+class QuasimetricNet(nn.Module):
+    def __init__(self, hidden_size=512):
+        super(QuasimetricNet, self).__init__()
+        self.hidden_size = hidden_size
+
+        init_ = lambda m: init(m, nn.init.orthogonal_, lambda x: nn.init.
+                            constant_(x, 0), nn.init.calculate_gain('relu'))
+        modules = [
+            init_(nn.Linear(hidden_size, hidden_size)),
+            nn.ReLU(),
+        ]
+        init_ = lambda m: init(m, nn.init.orthogonal_,
+            lambda x: nn.init.constant_(x, 0))
+        modules += [init_(nn.Linear(hidden_size, hidden_size * 2))]
+        self.mlp = nn.Sequential(*modules)
+        self.lam = nn.Parameter(torch.tensor([1.0], requires_grad=True))
+
+    def forward(self, obs: torch.Tensor, goal: torch.Tensor):
+        # Metric Residual Network (MRN) architecture (https://arxiv.org/pdf/2208.08133)
+        x_sym, x_asym = torch.split(self.mlp(obs), [self.hidden_size] * 2, dim=-1)
+        y_sym, y_asym = torch.split(self.mlp(goal), [self.hidden_size] * 2, dim=-1)
+        d_sym = torch.sqrt(torch.sum(torch.square(x_sym - y_sym) + 1e-8, dim=-1))
+        d_asym = torch.max(torch.relu(x_asym - y_asym), dim=-1).values
+        dist = d_sym + d_asym
+        return dist
 
 
 class PointNavResNetNet(Net):

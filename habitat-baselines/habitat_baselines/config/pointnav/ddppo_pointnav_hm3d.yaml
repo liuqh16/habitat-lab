@@ -98,3 +98,12 @@ habitat_baselines:
 
       e3b:
         ridge: 0.1
+
+      tdd:
+        aggregate_fn: min
+        energy_fn: mrn_pot
+        loss_fn: infonce_backward
+        discount: 0.99
+        temperature: 1.0
+        logsumexp_coef: 0.1
+        knn_k: 10
